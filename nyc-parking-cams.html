@@ -1,0 +1,230 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NYC Parking Spotter • Live Traffic Cams</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        #map { height: 100vh; width: 100%; }
+        .modal { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.8); align-items: center; justify-content: center; z-index: 50; }
+        .modal-content { background: white; max-width: 90%; max-height: 90%; border-radius: 12px; overflow: hidden; }
+        .camera-img { max-width: 100%; max-height: 70vh; display: block; margin: 0 auto; }
+    </style>
+</head>
+<body class="bg-gray-900 text-white">
+    <div class="flex h-screen">
+        <!-- Sidebar -->
+        <div class="w-80 bg-gray-800 p-6 flex flex-col">
+            <h1 class="text-3xl font-bold mb-2">🚗 NYC Parking Spotter</h1>
+            <p class="text-gray-400 mb-6">Live DOT traffic cams • Spot open curb spots instantly</p>
+            
+            <input id="search" type="text" placeholder="Search street or location..." 
+                   class="w-full px-4 py-3 bg-gray-700 rounded-xl mb-6 text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-500">
+            
+            <div class="mb-4 font-medium">Filter by Borough</div>
+            <div id="borough-filters" class="flex flex-wrap gap-2 mb-8"></div>
+            
+            <div class="text-xs text-gray-400 mb-2">Cameras online: <span id="cam-count" class="font-mono"></span></div>
+            
+            <div class="flex-1 overflow-auto text-sm" id="camera-list"></div>
+            
+            <div class="text-xs text-gray-500 mt-auto pt-6">
+                Powered by public NYC DOT cams<br>
+                Images update every few seconds • Visual parking check only
+            </div>
+        </div>
+        
+        <!-- Map -->
+        <div id="map" class="flex-1"></div>
+    </div>
+
+    <!-- Modal for live camera -->
+    <div id="modal" class="modal">
+        <div class="modal-content w-[640px]">
+            <div class="p-4 border-b flex items-center justify-between bg-gray-50">
+                <div>
+                    <div id="modal-name" class="font-semibold text-gray-900"></div>
+                    <div id="modal-borough" class="text-sm text-gray-500"></div>
+                </div>
+                <button onclick="closeModal()" class="text-gray-500 hover:text-gray-900 text-3xl leading-none">×</button>
+            </div>
+            <img id="modal-img" class="camera-img" alt="Live camera feed">
+            <div class="p-4 flex items-center gap-3 bg-white">
+                <button onclick="refreshImage()" 
+                        class="flex-1 bg-blue-600 hover:bg-blue-700 text-white px-6 py-3 rounded-2xl font-medium transition">
+                    🔄 Refresh Now
+                </button>
+                <div id="last-updated" class="text-xs text-gray-400 flex-1"></div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let map, cameras = [], markers = {}, currentCamera = null;
+        let activeBoroughs = new Set();
+
+        const boroughColors = {
+            "Manhattan": "#f97316",
+            "Brooklyn": "#10b981",
+            "Queens": "#3b82f6",
+            "Bronx": "#8b5cf6",
+            "Staten Island": "#ec4899"
+        };
+
+        async function loadCameras() {
+            try {
+                const res = await fetch('https://webcams.nyctmc.org/api/cameras');
+                cameras = await res.json();
+                
+                document.getElementById('cam-count').textContent = cameras.length;
+                
+                // Render borough filters
+                const boroughs = [...new Set(cameras.map(c => c.area))].sort();
+                const filterDiv = document.getElementById('borough-filters');
+                boroughs.forEach(b => {
+                    const btn = document.createElement('button');
+                    btn.textContent = b;
+                    btn.className = `px-4 py-2 rounded-2xl text-sm font-medium transition ${activeBoroughs.has(b) ? 'bg-white text-gray-900 shadow' : 'bg-gray-700 hover:bg-gray-600'}`;
+                    btn.onclick = () => toggleBorough(b, btn);
+                    filterDiv.appendChild(btn);
+                });
+                
+                initMap();
+                renderList();
+            } catch(e) {
+                alert("Could not load cameras (CORS issue? Try opening via a local server like 'npx serve' or GitHub Pages).");
+                console.error(e);
+            }
+        }
+
+        function toggleBorough(borough, btn) {
+            if (activeBoroughs.has(borough)) {
+                activeBoroughs.delete(borough);
+                btn.classList.remove('bg-white', 'text-gray-900', 'shadow');
+                btn.classList.add('bg-gray-700', 'hover:bg-gray-600');
+            } else {
+                activeBoroughs.add(borough);
+                btn.classList.add('bg-white', 'text-gray-900', 'shadow');
+                btn.classList.remove('bg-gray-700', 'hover:bg-gray-600');
+            }
+            renderList();
+            updateMapMarkers();
+        }
+
+        function initMap() {
+            map = L.map('map').setView([40.7128, -74.0060], 12);
+            L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+                attribution: '&copy; OpenStreetMap contributors'
+            }).addTo(map);
+
+            updateMapMarkers();
+        }
+
+        function updateMapMarkers() {
+            // Clear old markers
+            Object.values(markers).forEach(m => map.removeLayer(m));
+            markers = {};
+
+            const filtered = cameras.filter(c => {
+                if (activeBoroughs.size > 0 && !activeBoroughs.has(c.area)) return false;
+                return c.isOnline === true || c.isOnline === "true";
+            });
+
+            filtered.forEach(cam => {
+                const color = boroughColors[cam.area] || '#64748b';
+                const marker = L.circleMarker([cam.latitude, cam.longitude], {
+                    radius: 8,
+                    fillColor: color,
+                    color: '#fff',
+                    weight: 2,
+                    opacity: 1,
+                    fillOpacity: 0.9
+                }).addTo(map);
+
+                marker.bindTooltip(cam.name, { permanent: false, direction: 'top' });
+                marker.on('click', () => showCameraModal(cam));
+                markers[cam.id] = marker;
+            });
+        }
+
+        function renderList() {
+            const container = document.getElementById('camera-list');
+            container.innerHTML = '';
+            
+            const searchTerm = document.getElementById('search').value.toLowerCase().trim();
+            
+            let filtered = cameras.filter(c => {
+                if (activeBoroughs.size > 0 && !activeBoroughs.has(c.area)) return false;
+                if (searchTerm && !c.name.toLowerCase().includes(searchTerm)) return false;
+                return c.isOnline === true || c.isOnline === "true";
+            });
+
+            filtered.slice(0, 100).forEach(cam => {  // Limit list for performance
+                const div = document.createElement('div');
+                div.className = 'flex items-center gap-3 p-3 hover:bg-gray-700 rounded-2xl cursor-pointer mb-1';
+                div.innerHTML = `
+                    <div class="w-3 h-3 rounded-full" style="background-color: ${boroughColors[cam.area] || '#64748b'}"></div>
+                    <div class="flex-1">
+                        <div class="font-medium text-sm">${cam.name}</div>
+                        <div class="text-xs text-gray-400">${cam.area}</div>
+                    </div>
+                `;
+                div.onclick = () => showCameraModal(cam);
+                container.appendChild(div);
+            });
+
+            if (filtered.length === 0) {
+                container.innerHTML = `<div class="text-gray-400 text-center py-8">No cameras match your filters</div>`;
+            }
+        }
+
+        let imageRefreshInterval = null;
+
+        function showCameraModal(cam) {
+            currentCamera = cam;
+            document.getElementById('modal-name').textContent = cam.name;
+            document.getElementById('modal-borough').textContent = cam.area;
+            
+            const modal = document.getElementById('modal');
+            modal.style.display = 'flex';
+            
+            loadImage(cam);
+            
+            // Auto-refresh every 10 seconds
+            if (imageRefreshInterval) clearInterval(imageRefreshInterval);
+            imageRefreshInterval = setInterval(() => loadImage(cam), 10000);
+        }
+
+        function loadImage(cam) {
+            const img = document.getElementById('modal-img');
+            const timestamp = new Date().getTime();
+            // Public image URL from the API
+            img.src = `https://webcams.nyctmc.org/api/cameras/${cam.id}/image?t=${timestamp}`;
+            
+            document.getElementById('last-updated').textContent = `Last updated: just now`;
+        }
+
+        function refreshImage() {
+            if (currentCamera) loadImage(currentCamera);
+        }
+
+        function closeModal() {
+            const modal = document.getElementById('modal');
+            modal.style.display = 'none';
+            if (imageRefreshInterval) {
+                clearInterval(imageRefreshInterval);
+                imageRefreshInterval = null;
+            }
+        }
+
+        // Search input live filter
+        document.getElementById('search').addEventListener('input', renderList);
+
+        // Load everything
+        window.onload = loadCameras;
+    </script>
+</body>
+</html>
